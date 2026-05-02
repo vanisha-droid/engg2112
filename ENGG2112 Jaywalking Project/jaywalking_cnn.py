@@ -10,7 +10,7 @@ into two categories:
     - "jaywalk"    → an image showing jaywalking behaviour
     - "no_jaywalk" → an image showing safe/normal pedestrian behaviour
 
-The images it trains on come from the Street Scene dataset (supplied by Shiyao).
+The images it trains on come from the Street Scene dataset.
 These images already have bounding boxes drawn around the jaywalkers, so the
 CNN sees the box markings as part of the visual input and learns to associate
 them with the jaywalking label.
@@ -239,7 +239,7 @@ def load_data(data_dir):
 #   │   maximum value in each 2×2 block. Keeps the strongest  │
 #   │   signals. Makes the model size-robust.                 │
 #   ├─────────────────────────────────────────────────────────┤
-#   │ GLOBALAVERAGEPOOLING                                     │
+#   │ GLOBALAVERAGEPOOLING                                    │
 #   │   Collapses each feature map to a single average number.│
 #   │   Turns a 7×7×512 tensor into a vector of 512 numbers.  │
 #   ├─────────────────────────────────────────────────────────┤
