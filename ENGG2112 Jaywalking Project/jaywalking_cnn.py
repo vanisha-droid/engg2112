@@ -61,6 +61,7 @@ from tensorflow.keras import layers
 
 # scikit-learn gives us evaluation tools (F1, precision, recall, etc.)
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 
 
 # ══════════════════════════════════════════════════════════════
@@ -70,7 +71,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 # not hunt through hundreds of lines of code.
 
 # --- CHANGE THIS: path to your Street Scene dataset folder ---
-STREET_SCENE_DIR = r"C:\path\to\street_scene"   # e.g. r"C:\Users\Shiyao\street_scene"
+STREET_SCENE_DIR = r"C:\Users\vkolm\OneDrive\Documents\ENGG2112\data\cityscapes-aug-dataset"   # e.g. r"C:\Users\Shiyao\street_scene"
 
 # Class names — must exactly match the subfolder names in train/val/test.
 CLASS_NAMES = ["jaywalk", "no_jaywalk"]
@@ -100,6 +101,10 @@ USE_TRANSFER_LEARNING = True
 
 # Where to save model files, plots, etc. (same folder as this script by default)
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Classification threshold: sigmoid output >= THRESHOLD → predicted as class 1 (no_jaywalk).
+# Lower this (e.g. 0.35) to flag more jaywalkers (better recall, more false alarms).
+THRESHOLD = 0.5
 
 
 # ══════════════════════════════════════════════════════════════
@@ -133,33 +138,28 @@ def load_data(data_dir):
                       (shuffle=False so we can match predictions to filenames later)
     """
 
-    # Training generator: includes augmentation (artificial data variety)
+    # Training generator: includes augmentation (artificial data variety).
+    # No rescale here — each model handles its own normalisation internally
+    # (scratch CNN has a Rescaling layer; MobileNetV2 uses preprocess_input).
     train_datagen = keras.preprocessing.image.ImageDataGenerator(
-        rescale=1.0 / 255,       # Normalise pixel values: 0-255 → 0-1
-                                  # Neural networks train much faster when
-                                  # inputs are small numbers near 0.
+        horizontal_flip=True,
 
-        horizontal_flip=True,     # Randomly mirror image left-right.
-                                  # A person jaywalking from left is the same
-                                  # as one jaywalking from the right.
+        brightness_range=[0.6, 1.4],  # ±40% lighting variation — handles street/overhead
+                                       # angle differences and varying times of day.
 
-        brightness_range=[0.8, 1.2],  # Randomly make image 20% darker or brighter.
-                                      # Makes the model robust to different lighting.
+        zoom_range=0.2,               # up to 20% zoom — important for small dataset.
 
-        zoom_range=0.1,           # Randomly zoom in/out up to 10%.
+        rotation_range=15,            # ±15° rotation — cameras aren't always level.
 
-        rotation_range=5,         # Tiny random rotation (±5°). Street cameras
-                                  # can be slightly tilted.
+        width_shift_range=0.1,        # shift person slightly left/right in frame.
+        height_shift_range=0.1,       # shift slightly up/down.
+        shear_range=0.05,             # small perspective shear.
 
-        fill_mode="nearest"       # When rotating, fill empty corners by
-                                  # repeating nearby pixel values.
+        fill_mode="nearest"
     )
 
     # Validation and test generators: NO augmentation — we need a fair evaluation.
-    # Only rescale (normalise) so the numbers match what the model was trained on.
-    eval_datagen = keras.preprocessing.image.ImageDataGenerator(
-        rescale=1.0 / 255
-    )
+    eval_datagen = keras.preprocessing.image.ImageDataGenerator()
 
     print(f"\n{'='*55}")
     print("LOADING DATA")
@@ -210,7 +210,18 @@ def load_data(data_dir):
         bar  = "█" * (cnt // max(1, train_gen.n // 40))
         print(f"  {name:<14} {cnt:>5} ({pct:.1f}%)  {bar}")
 
-    return train_gen, val_gen, test_gen
+    # Compute class weights to counteract imbalance without discarding data.
+    # A class with half as many images gets twice the weight, so the model
+    # treats each class equally regardless of sample count.
+    cw_values = compute_class_weight(
+        class_weight="balanced",
+        classes=np.unique(train_gen.classes),
+        y=train_gen.classes
+    )
+    class_weights = dict(enumerate(cw_values))
+    print(f"\nClass weights (auto-balanced): {class_weights}")
+
+    return train_gen, val_gen, test_gen, class_weights
 
 
 # ══════════════════════════════════════════════════════════════
@@ -266,6 +277,9 @@ def build_scratch_cnn(input_shape):
     # input_shape = (224, 224, 3) — height, width, channels.
     inputs = keras.Input(shape=input_shape, name="input_image")
 
+    # Normalise 0-255 → 0-1 inside the model so the generator passes raw pixels.
+    x = layers.Rescaling(1.0 / 255, name="rescale")(inputs)
+
     # ── Conv Block 1 ──────────────────────────────────────────
     # Conv2D(32, (3,3)):
     #   32 = number of filters (detectors). Each learns a different pattern.
@@ -274,7 +288,7 @@ def build_scratch_cnn(input_shape):
     #   activation="relu" = apply ReLU immediately after convolution.
     #   padding="same" = add zeros around the border so the output stays
     #                    the same spatial size as the input (no shrinking yet).
-    x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", name="conv1a")(inputs)
+    x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", name="conv1a")(x)
     x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", name="conv1b")(x)
     # MaxPooling2D((2,2)):
     #   Shrinks from 224×224 → 112×112 by taking the max in each 2×2 block.
@@ -466,29 +480,34 @@ def get_callbacks(run_label="run"):
 #          reduces loss.
 #     Repeat until EarlyStopping says "enough".
 
-def train_phase1(model, train_gen, val_gen):
+def train_phase1(model, train_gen, val_gen, class_weights=None):
     """Compiles and trains the model (Phase 1 — head only for transfer learning)."""
 
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-        loss="binary_crossentropy",   # for binary (2-class) output with sigmoid
-        metrics=["accuracy"]
+        loss="binary_crossentropy",
+        metrics=[
+            "accuracy",
+            keras.metrics.Precision(name="precision"),
+            keras.metrics.Recall(name="recall"),
+        ]
     )
 
-    model.summary()   # prints a table of all layers and parameter counts
+    model.summary()
 
     print(f"\nPhase 1 training (up to {EPOCHS} epochs) ...")
     history = model.fit(
-        train_gen,                          # training data generator
+        train_gen,
         epochs=EPOCHS,
-        validation_data=val_gen,            # validation data generator
-        callbacks=get_callbacks("phase1"),  # early stopping, LR reduction, checkpoint
-        verbose=1                           # print progress each epoch
+        validation_data=val_gen,
+        class_weight=class_weights,         # upweight minority class each batch
+        callbacks=get_callbacks("phase1"),
+        verbose=1
     )
     return history
 
 
-def fine_tune(model, train_gen, val_gen):
+def fine_tune(model, train_gen, val_gen, class_weights=None):
     """
     Phase 2 (transfer learning only): Unfreeze top layers and train further.
 
@@ -520,13 +539,18 @@ def fine_tune(model, train_gen, val_gen):
     model.compile(
         optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE / 100),
         loss="binary_crossentropy",
-        metrics=["accuracy"]
+        metrics=[
+            "accuracy",
+            keras.metrics.Precision(name="precision"),
+            keras.metrics.Recall(name="recall"),
+        ]
     )
 
     history_ft = model.fit(
         train_gen,
-        epochs=20,                              # fewer epochs — already close to good
+        epochs=20,
         validation_data=val_gen,
+        class_weight=class_weights,
         callbacks=get_callbacks("finetune"),
         verbose=1
     )
@@ -562,16 +586,13 @@ def evaluate(model, test_gen):
     y_prob = model.predict(test_gen, verbose=1).flatten()
 
     # Convert probabilities to hard class labels.
-    # threshold 0.5: above 0.5 → "jaywalk" (1), below → "no_jaywalk" (0).
-    # Lower the threshold (e.g. 0.4) to catch more jaywalkers at the cost
-    # of more false alarms (better recall, lower precision).
-    THRESHOLD = 0.5
+    # THRESHOLD is set in the config section at the top of this file.
     y_pred = (y_prob >= THRESHOLD).astype(int)
-    y_true = test_gen.classes   # ground-truth labels from folder structure
+    y_true = test_gen.classes
 
-    # Map class indices back to names for readable output.
-    # test_gen.class_indices = {"jaywalk": 0, "no_jaywalk": 1} or similar.
-    idx_to_name = {v: k for k, v in test_gen.class_indices.items()}
+    # Build idx_to_name from CLASS_NAMES (alphabetical, same as Keras folder ordering).
+    # Using test_gen.class_indices would crash if the test set only has one class present.
+    idx_to_name  = {i: name for i, name in enumerate(sorted(CLASS_NAMES))}
     target_names = [idx_to_name[i] for i in range(NUM_CLASSES)]
 
     print(f"\nThreshold used: {THRESHOLD}")
@@ -590,6 +611,18 @@ def evaluate(model, test_gen):
     for i, row in enumerate(cm):
         row_str = "  ".join(f"{v:>10}" for v in row)
         print(f"  {target_names[i][:14]:>14}  {row_str}")
+
+    # Per-image predictions
+    print(f"\n{'─'*70}")
+    print(f"{'IMAGE':<45} {'TRUE':<12} {'PRED':<12} {'CONFIDENCE':>10}")
+    print(f"{'─'*70}")
+    for fname, true_idx, pred_idx, prob in zip(test_gen.filenames, y_true, y_pred, y_prob):
+        true_label = idx_to_name[true_idx]
+        pred_label = idx_to_name[pred_idx]
+        correct    = "✓" if true_idx == pred_idx else "✗"
+        conf       = prob if pred_idx == 1 else 1 - prob
+        print(f"{os.path.basename(fname):<45} {true_label:<12} {pred_label:<12} {conf:>9.1%}  {correct}")
+    print(f"{'─'*70}")
 
     return y_true, y_pred, y_prob
 
@@ -655,7 +688,7 @@ def main():
     print(f"Input size: {IMG_HEIGHT}×{IMG_WIDTH}×{IMG_CHANNELS}")
 
     # ── 1. Load data ──────────────────────────────────────────
-    train_gen, val_gen, test_gen = load_data(STREET_SCENE_DIR)
+    train_gen, val_gen, test_gen, class_weights = load_data(STREET_SCENE_DIR)
 
     # ── 2. Build model ────────────────────────────────────────
     input_shape = (IMG_HEIGHT, IMG_WIDTH, IMG_CHANNELS)
@@ -665,12 +698,12 @@ def main():
         model = build_scratch_cnn(input_shape)
 
     # ── 3. Train Phase 1 ──────────────────────────────────────
-    history = train_phase1(model, train_gen, val_gen)
+    history = train_phase1(model, train_gen, val_gen, class_weights)
     plot_history(history, "training_phase1.png")
 
     # ── 4. Fine-tune Phase 2 (transfer learning only) ─────────
     if USE_TRANSFER_LEARNING:
-        history_ft = fine_tune(model, train_gen, val_gen)
+        history_ft = fine_tune(model, train_gen, val_gen, class_weights)
         if history_ft:
             plot_history(history_ft, "training_finetune.png")
 
