@@ -57,7 +57,7 @@ import matplotlib.pyplot as plt
 # building neural networks much simpler.
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
+from tensorflow.keras import layers, regularizers
 
 # scikit-learn gives us evaluation tools (F1, precision, recall, etc.)
 from sklearn.metrics import classification_report, confusion_matrix
@@ -90,8 +90,8 @@ BATCH_SIZE    = 16    # How many images to feed in per weight update.
                       # Think of it as: study 16 flashcards, then update your notes.
 EPOCHS        = 30    # Maximum number of full passes through the training set.
                       # Early stopping (below) will halt training before this if needed.
-LEARNING_RATE = 0.001 # How big each weight-update step is.
-                      # Too big → overshoots the answer. Too small → takes forever.
+LEARNING_RATE = 0.0005 # How big each weight-update step is.
+                       # Too big → overshoots the answer. Too small → takes forever.
 RANDOM_SEED   = 42    # Makes results reproducible. Same seed = same results each run.
 
 # Transfer learning switch
@@ -288,8 +288,10 @@ def build_scratch_cnn(input_shape):
     #   activation="relu" = apply ReLU immediately after convolution.
     #   padding="same" = add zeros around the border so the output stays
     #                    the same spatial size as the input (no shrinking yet).
-    x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", name="conv1a")(x)
-    x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", name="conv1b")(x)
+    L2 = regularizers.l2(1e-4)   # shared L2 penalty applied to all conv layers
+
+    x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv1a")(x)
+    x = layers.Conv2D(32, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv1b")(x)
     # MaxPooling2D((2,2)):
     #   Shrinks from 224×224 → 112×112 by taking the max in each 2×2 block.
     #   This reduces computation and makes the model less sensitive to exact
@@ -301,37 +303,42 @@ def build_scratch_cnn(input_shape):
     # ── Conv Block 2 ──────────────────────────────────────────
     # Now 64 filters — more patterns because we've already narrowed the image.
     # Each filter now "sees" a larger effective region because of the pooling above.
-    x = layers.Conv2D(64, (3, 3), activation="relu", padding="same", name="conv2a")(x)
-    x = layers.Conv2D(64, (3, 3), activation="relu", padding="same", name="conv2b")(x)
+    x = layers.Conv2D(64, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv2a")(x)
+    x = layers.Conv2D(64, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv2b")(x)
     x = layers.MaxPooling2D((2, 2), name="pool2")(x)
     # 112×112 → 56×56
     x = layers.BatchNormalization(name="bn2")(x)
 
     # ── Conv Block 3 ──────────────────────────────────────────
     # 128 filters — even more complex patterns at this level.
-    x = layers.Conv2D(128, (3, 3), activation="relu", padding="same", name="conv3a")(x)
-    x = layers.Conv2D(128, (3, 3), activation="relu", padding="same", name="conv3b")(x)
+    x = layers.Conv2D(128, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv3a")(x)
+    x = layers.Conv2D(128, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv3b")(x)
     x = layers.MaxPooling2D((2, 2), name="pool3")(x)
     # 56×56 → 28×28
     x = layers.BatchNormalization(name="bn3")(x)
 
+    # ── Conv Block 4 ──────────────────────────────────────────
+    # 256 filters — higher-level, task-specific features (posture, bounding box
+    # markings, pedestrian context) that only emerge at deeper layers.
+    x = layers.Conv2D(256, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv4a")(x)
+    x = layers.Conv2D(256, (3, 3), activation="relu", padding="same", kernel_regularizer=L2, name="conv4b")(x)
+    x = layers.MaxPooling2D((2, 2), name="pool4")(x)
+    # 28×28 → 14×14
+    x = layers.BatchNormalization(name="bn4")(x)
+
     # ── GlobalAveragePooling ───────────────────────────────────
-    # After Conv Block 3 we have 128 feature maps of size 28×28.
-    # GlobalAveragePooling takes the average of all 28×28 = 784 values in each
-    # feature map, collapsing it to a single number.
-    # Result: a flat vector of 128 numbers summarising what patterns were found.
+    # After Conv Block 4 we have 256 feature maps of size 14×14.
+    # GlobalAveragePooling collapses each map to a single average number.
+    # Result: a flat vector of 256 numbers summarising what patterns were found.
     x = layers.GlobalAveragePooling2D(name="gap")(x)
 
     # ── Dense (MLP) Head ──────────────────────────────────────
-    # This is just like the MLP from Week 8 — fully connected neurons that
-    # learn to combine the 128 extracted features into a classification.
+    # Two dense layers (matching the transfer model's head structure) give the
+    # classifier more capacity to combine the extracted features.
     x = layers.Dense(256, activation="relu", name="dense1")(x)
-
-    # Dropout(0.5): during training, randomly set 50% of neurons to 0.
-    # This stops the model from becoming too reliant on any single neuron
-    # and forces it to learn more robust features → less overfitting.
-    # During testing/prediction, dropout is automatically disabled.
-    x = layers.Dropout(0.5, name="dropout")(x)
+    x = layers.Dropout(0.3, name="dropout1")(x)
+    x = layers.Dense(128, activation="relu", name="dense2")(x)
+    x = layers.Dropout(0.2, name="dropout2")(x)
 
     # ── Output Layer ──────────────────────────────────────────
     # 1 neuron with sigmoid activation.
@@ -699,19 +706,19 @@ def main():
 
     # ── 3. Train Phase 1 ──────────────────────────────────────
     history = train_phase1(model, train_gen, val_gen, class_weights)
-    plot_history(history, "training_phase1.png")
+    plot_history(history, "training_transfer.png")
 
     # ── 4. Fine-tune Phase 2 (transfer learning only) ─────────
     if USE_TRANSFER_LEARNING:
         history_ft = fine_tune(model, train_gen, val_gen, class_weights)
         if history_ft:
-            plot_history(history_ft, "training_finetune.png")
+            plot_history(history_ft, "training_finetune_transfer.png")
 
     # ── 5. Evaluate on test set ───────────────────────────────
     evaluate(model, test_gen)
 
     # ── 6. Save the trained model ─────────────────────────────
-    model_path = os.path.join(OUTPUT_DIR, "jaywalking_cnn.keras")
+    model_path = os.path.join(OUTPUT_DIR, "jaywalking_cnn_transfer.keras")
     model.save(model_path)
     print(f"\nModel saved → {model_path}")
     print("\nDone! Now run yolo_preprocess.py to annotate Cityscapes images.")
