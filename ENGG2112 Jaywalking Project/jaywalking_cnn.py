@@ -48,8 +48,7 @@ pip install tensorflow scikit-learn matplotlib
 import os
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")   # Saves figures to files instead of opening a popup window.
-                        # This works even on servers or machines without a display.
+matplotlib.use("TkAgg")  # Display figures in a window (change to "Agg" for server use)
 import matplotlib.pyplot as plt
 
 # TensorFlow is Google's deep learning library.
@@ -88,7 +87,7 @@ IMG_CHANNELS = 3    # 3 channels = RGB (red, green, blue). Always 3 for colour i
 # Training settings
 BATCH_SIZE    = 16    # How many images to feed in per weight update.
                       # Think of it as: study 16 flashcards, then update your notes.
-EPOCHS        = 30    # Maximum number of full passes through the training set.
+EPOCHS        = 50    # Maximum number of full passes through the training set.
                       # Early stopping (below) will halt training before this if needed.
 LEARNING_RATE = 0.0005 # How big each weight-update step is.
                        # Too big → overshoots the answer. Too small → takes forever.
@@ -97,7 +96,7 @@ RANDOM_SEED   = 42    # Makes results reproducible. Same seed = same results eac
 # Transfer learning switch
 # True  = use MobileNetV2 (pre-trained on 1.2M images — recommended for small datasets)
 # False = train CNN from scratch (simpler but needs more data to work well)
-USE_TRANSFER_LEARNING = True
+USE_TRANSFER_LEARNING = False
 
 # Where to save model files, plots, etc. (same folder as this script by default)
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -439,12 +438,6 @@ def get_callbacks(run_label="run"):
     best_path = os.path.join(OUTPUT_DIR, f"best_model_{run_label}.keras")
 
     return [
-        keras.callbacks.EarlyStopping(
-            monitor="val_loss",        # watch validation loss
-            patience=8,                # stop if no improvement for 8 epochs
-            restore_best_weights=True, # revert to best weights when stopped
-            verbose=1
-        ),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
             factor=0.5,                # multiply LR by 0.5 when stuck
@@ -645,29 +638,31 @@ def evaluate(model, test_gen):
 #   UNDERFITTING: Both losses stay high. Model isn't learning.
 #                 Fix: more epochs, larger model, lower learning rate.
 
-def plot_history(history, filename="training_curves.png"):
-    """Saves a 2-panel training history plot to disk."""
+def plot_history(history, filename="training_curves.png", epoch_offset=0):
+    """Displays and saves a 2-panel training/validation loss & accuracy plot."""
     save_path = os.path.join(OUTPUT_DIR, filename)
+
+    epochs = range(epoch_offset + 1, epoch_offset + len(history.history["loss"]) + 1)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
     fig.suptitle("ENGG2112 — Jaywalking CNN Training", fontsize=14)
 
-    # Loss plot
-    ax1.plot(history.history["loss"],     label="Training loss",   color="royalblue")
-    ax1.plot(history.history["val_loss"], label="Validation loss", color="tomato",
+    # ── Loss ─────────────────────────────────────────────────────
+    ax1.plot(epochs, history.history["loss"],     label="Training loss",   color="royalblue")
+    ax1.plot(epochs, history.history["val_loss"], label="Validation loss", color="tomato",
              linestyle="--")
-    ax1.set_title("Loss per Epoch\n(overfitting = val rises while train falls)")
+    ax1.set_title("Training vs Validation Loss per Epoch")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Binary Cross-Entropy Loss")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # Accuracy plot
-    ax2.plot(history.history["accuracy"],     label="Training accuracy",   color="royalblue")
-    ax2.plot(history.history["val_accuracy"], label="Validation accuracy", color="tomato",
+    # ── Accuracy ──────────────────────────────────────────────────
+    ax2.plot(epochs, history.history["accuracy"],     label="Training accuracy",   color="royalblue")
+    ax2.plot(epochs, history.history["val_accuracy"], label="Validation accuracy", color="tomato",
              linestyle="--")
     ax2.axhline(y=0.80, color="green", linestyle=":", alpha=0.7, label="Target (0.80)")
-    ax2.set_title("Accuracy per Epoch")
+    ax2.set_title("Training vs Validation Accuracy per Epoch")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Accuracy")
     ax2.legend()
@@ -675,8 +670,41 @@ def plot_history(history, filename="training_curves.png"):
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=120)
-    plt.close()
     print(f"\nPlot saved → {save_path}")
+    plt.show()
+
+
+def plot_combined_history(history_p1, history_ft, filename="training_combined.png"):
+    """Plots phase 1 + fine-tune as one continuous loss curve."""
+    save_path = os.path.join(OUTPUT_DIR, filename)
+
+    loss     = history_p1.history["loss"]     + history_ft.history["loss"]
+    val_loss = history_p1.history["val_loss"] + history_ft.history["val_loss"]
+    acc      = history_p1.history["accuracy"] + history_ft.history["accuracy"]
+    val_acc  = history_p1.history["val_accuracy"] + history_ft.history["val_accuracy"]
+    epochs   = range(1, len(loss) + 1)
+    p1_end   = len(history_p1.history["loss"])   # epoch where fine-tune begins
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    fig.suptitle("ENGG2112 — Full Training Curve (Phase 1 + Fine-tune)", fontsize=14)
+
+    for ax, train, val, ylabel, title in [
+        (ax1, loss,  val_loss, "Binary Cross-Entropy Loss", "Training vs Validation Loss"),
+        (ax2, acc,   val_acc,  "Accuracy",                  "Training vs Validation Accuracy"),
+    ]:
+        ax.plot(epochs, train, label="Training",   color="royalblue")
+        ax.plot(epochs, val,   label="Validation", color="tomato", linestyle="--")
+        ax.axvline(p1_end, color="gray", linestyle=":", lw=1.5, label=f"Fine-tune start (ep {p1_end})")
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120)
+    print(f"\nCombined plot saved → {save_path}")
+    plt.show()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -706,19 +734,21 @@ def main():
 
     # ── 3. Train Phase 1 ──────────────────────────────────────
     history = train_phase1(model, train_gen, val_gen, class_weights)
-    plot_history(history, "training_transfer.png")
+    plot_history(history, "training_phase1.png")
 
     # ── 4. Fine-tune Phase 2 (transfer learning only) ─────────
     if USE_TRANSFER_LEARNING:
         history_ft = fine_tune(model, train_gen, val_gen, class_weights)
         if history_ft:
-            plot_history(history_ft, "training_finetune_transfer.png")
+            p1_epochs = len(history.history["loss"])
+            plot_history(history_ft, "training_finetune.png", epoch_offset=p1_epochs)
+            plot_combined_history(history, history_ft, "training_combined.png")
 
     # ── 5. Evaluate on test set ───────────────────────────────
     evaluate(model, test_gen)
 
     # ── 6. Save the trained model ─────────────────────────────
-    model_path = os.path.join(OUTPUT_DIR, "jaywalking_cnn_transfer.keras")
+    model_path = os.path.join(OUTPUT_DIR, "jaywalking_cnn.keras")
     model.save(model_path)
     print(f"\nModel saved → {model_path}")
     print("\nDone! Now run yolo_preprocess.py to annotate Cityscapes images.")
